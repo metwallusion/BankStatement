@@ -23,12 +23,15 @@ def parse_pdf(pdf_path):
                     date_str, desc, amt_str = match.groups()
                     date_dt = datetime.strptime(date_str, "%m/%d/%y")
                     date_fmt = f"{date_dt.month}/{date_dt.day}/{date_dt.year}"
-                    amount = float(amt_str.replace("$", "").replace(",", "").replace("-", ""))
+                    is_withdrawal = amt_str.strip().startswith("-")
+                    amount = float(
+                        amt_str.replace("$", "").replace(",", "").replace("+", "").replace("-", "")
+                    )
+                    if is_withdrawal:
+                        amount = -amount
                     current = {
                         "Date": date_fmt,
                         "Amount": amount,
-                        "Deposit": amount,
-                        "Withdrawal": "",
                         "Memo": desc.strip(),
                     }
                 else:
@@ -42,14 +45,12 @@ def parse_pdf(pdf_path):
 def write_csv(rows, out_path):
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Row #", "Date", "Amount", "Deposit", "Withdrawal", "Memo"])
+        writer.writerow(["Row #", "Date", "Amount", "Memo"])
         for i, row in enumerate(rows, 1):
             writer.writerow([
                 i,
                 row["Date"],
                 f"{row['Amount']}",
-                f"{row['Deposit']}",
-                row["Withdrawal"],
                 row["Memo"],
             ])
 
