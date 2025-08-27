@@ -39,6 +39,7 @@ def parse_pdf(pdf_source):
         pdf_source.seek(0)
 
     with pdfplumber.open(pdf_source) as pdf:
+
         for page in pdf.pages:
             text = page.extract_text()
             if not text:
