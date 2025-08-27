@@ -21,7 +21,6 @@ if uploads:
             state_key = f"df_{uploaded.name}"
             if state_key not in st.session_state:
                 st.session_state[state_key] = df
-
             df_state = st.session_state[state_key]
 
             col1, col2, col3 = st.columns(3)
