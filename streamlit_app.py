@@ -1,5 +1,4 @@
 import streamlit as st
-from io import BytesIO
 from pathlib import Path
 import pandas as pd
 from parse_bank_statement import parse_pdf
@@ -13,8 +12,8 @@ uploads = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=Tr
 if uploads:
     for uploaded in uploads:
         with st.spinner(f"Processing {uploaded.name}. Please wait..."):
-            pdf_bytes = BytesIO(uploaded.read())
-            rows = parse_pdf(pdf_bytes)
+            uploaded.seek(0)
+            rows = parse_pdf(uploaded)
             df = pd.DataFrame(rows)
 
         with st.expander(uploaded.name):
