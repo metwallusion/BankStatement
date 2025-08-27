@@ -15,12 +15,12 @@ if uploads:
             uploaded.seek(0)
             rows = parse_pdf(uploaded)
             df = pd.DataFrame(rows)
+            df.insert(0, "Selected", False)
 
         with st.expander(uploaded.name):
             state_key = f"df_{uploaded.name}"
             if state_key not in st.session_state:
-                st.session_state[state_key] = df.assign(Selected=False)
-
+                st.session_state[state_key] = df
             df_state = st.session_state[state_key]
 
             col1, col2, col3 = st.columns(3)
@@ -28,7 +28,7 @@ if uploads:
                 if st.button("Select All", key=f"select_all_{uploaded.name}"):
                     df_state["Selected"] = True
             with col2:
-                if st.button("Clear Selection", key=f"clear_sel_{uploaded.name}"):
+                if st.button("Unselect All", key=f"unselect_all_{uploaded.name}"):
                     df_state["Selected"] = False
             with col3:
                 if st.button("Flip Signs", key=f"flip_{uploaded.name}"):
