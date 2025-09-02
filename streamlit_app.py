@@ -1,6 +1,7 @@
 import streamlit as st
 from pathlib import Path
 import pandas as pd
+import pdfplumber
 from parse_bank_statement import parse_pdf
 
 st.title("Bank Statement PDF to CSV")
@@ -14,6 +15,22 @@ if uploads:
         with st.spinner(f"Processing {uploaded.name}. Please wait..."):
             uploaded.seek(0)
             rows = parse_pdf(uploaded)
+            if not rows:
+                st.error("No transactions found; check PDF format or parser")
+                # Offer raw text for debugging purposes.
+                try:
+                    uploaded.seek(0)
+                    with pdfplumber.open(uploaded) as pdf:
+                        raw_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                    st.download_button(
+                        f"Download raw text from {uploaded.name}",
+                        raw_text,
+                        file_name=f"{Path(uploaded.name).stem}.txt",
+                        mime="text/plain",
+                    )
+                except Exception:
+                    pass
+                continue
             df = pd.DataFrame(rows)
             df.insert(0, "Selected", False)
 
@@ -38,7 +55,6 @@ if uploads:
 
             df_state = st.data_editor(df_state, key=f"editor_{uploaded.name}")
             st.session_state[state_key] = df_state
-
             csv_name = f"{Path(uploaded.name).stem}.csv"
             csv_data = df_state.drop(columns=["Selected"]).to_csv(index=False)
             st.download_button(
