@@ -23,6 +23,26 @@ HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+ch
 MEMO_CLEAN_RE = re.compile(r"(summary|detail|closing|account|page|new\s+charges?)", re.I)
 
 
+def detect_brand(pdf) -> str:
+    # Read first couple of pages; normalize spacing for robust substring checks
+    txt = " ".join((pdf.pages[i].extract_text() or "") for i in range(min(2, len(pdf.pages)))).lower()
+    txt = re.sub(r"\s+", " ", txt)
+    if "wells fargo" in txt and ("transaction history" in txt or "deposits/ credits" in txt or "withdrawals/ debits" in txt):
+        return "wells"
+    if "american express" in txt or "membership rewards" in txt:
+        return "amex"
+    return "generic"
+
+NEGATIVE_HINTS = (
+    "purchase authorized", "withdrawal", "ach debit", "zelle to",
+    "payment", "check", "debit", "card", "b2p"
+)
+POSITIVE_HINTS = (
+    "le - usa technol", "usa technol",  # WF settlements
+    "deposit", "edeposit", "atm cash deposit", "credit", "refund", "zelle from"
+)
+
+
 def infer_year_from_filename(path_or_name: str) -> Optional[int]:
     """Infer year from a file name if possible."""
     if not path_or_name:
@@ -68,38 +88,21 @@ def clean_amount_str(s: str) -> float:
     return -amount if negative else amount
 
 
-def guess_sign(desc: str, amount_has_minus: bool) -> int:
-    """Guess sign based on description when amount lacks explicit sign."""
+def guess_sign(desc: str, amount_has_minus: bool, brand: str) -> int:
+    d = desc.lower()
+    if brand == "amex" and amount_has_minus and ("credit" in d or "refund" in d):
+        return +1
     if amount_has_minus:
         return -1
-    desc_l = desc.lower()
-    neg_kw = [
-        "purchase",
-        "withdrawal",
-        "card",
-        "fee",
-        "check",
-        "ach debit",
-        "payment",
-    ]
-    pos_kw = [
-        "deposit",
-        "refund",
-        "credit",
-        "zelle from",
-        "edeposit",
-        "atm cash deposit",
-    ]
-    for kw in neg_kw:
-        if kw in desc_l:
-            return -1
-    for kw in pos_kw:
-        if kw in desc_l:
-            return 1
-    return -1
+    if any(k in d for k in NEGATIVE_HINTS):
+        return -1
+    if any(k in d for k in POSITIVE_HINTS):
+        return +1
+    # Brand-specific default when ambiguous:
+    return +1 if brand == "wells" else -1
 
 
-def parse_amount_from_line(line: str, memo_so_far: str):
+def parse_amount_from_line(line: str, memo_so_far: str, brand: str):
     """Return (amount, leftover_memo) if line contains an amount."""
     token = None
     leftover = line
@@ -124,7 +127,7 @@ def parse_amount_from_line(line: str, memo_so_far: str):
     raw = clean_amount_str(token)
     amount_has_minus = raw < 0
     desc_for_sign = (memo_so_far + " " + leftover).strip()
-    sign = guess_sign(desc_for_sign, amount_has_minus)
+    sign = guess_sign(desc_for_sign, amount_has_minus, brand)
     amount = abs(raw) * sign
     leftover = MONEY_INLINE.sub('', leftover).strip()
     if MEMO_CLEAN_RE.search(leftover):
@@ -147,6 +150,7 @@ def parse_pdf(pdf_source):
         pdf_source.seek(0)
 
     with pdfplumber.open(pdf_source) as pdf:
+        brand = detect_brand(pdf)
         for page in pdf.pages:
             text = page.extract_text()
             if not text:
@@ -209,14 +213,29 @@ def parse_pdf(pdf_source):
                     }
                     mode = "sm"
                     if rest.strip():
-                        amt, leftover = parse_amount_from_line(rest.strip(), current_tx["Memo"])
-                        if amt is not None:
-                            if leftover:
-                                current_tx["Memo"] = leftover
-                            current_tx["Amount"] = amt
+                        desc_part = rest.strip()
+                        money_match = MONEY_INLINE.search(desc_part)
+                        if money_match:
+                            amt_raw = money_match.group(1)
+                            memo = desc_part[: money_match.start()].strip()
+                            current_tx["Memo"] = memo
+                            raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
+                            amount = float(raw)
+                            has_minus = "-" in amt_raw
+                            sign = guess_sign(memo, has_minus, brand)
+                            current_tx["Amount"] = amount * (-1 if sign < 0 else 1)
                             rows.append(current_tx)
                             current_tx = None
                             mode = None
+                        else:
+                            amt, leftover = parse_amount_from_line(desc_part, current_tx["Memo"], brand)
+                            if amt is not None:
+                                if leftover:
+                                    current_tx["Memo"] = leftover
+                                current_tx["Amount"] = amt
+                                rows.append(current_tx)
+                                current_tx = None
+                                mode = None
                     continue
 
                 if mode == "pattern" and current_tx:
@@ -226,7 +245,7 @@ def parse_pdf(pdf_source):
                 if mode == "sm" and current_tx:
                     if HEADER_RE.search(line):
                         continue
-                    amt, leftover = parse_amount_from_line(line, current_tx["Memo"])
+                    amt, leftover = parse_amount_from_line(line, current_tx["Memo"], brand)
                     if amt is not None:
                         if leftover:
                             current_tx["Memo"] = (current_tx["Memo"] + " " + leftover).strip()
@@ -251,7 +270,7 @@ def parse_pdf(pdf_source):
         cleaned.append(r)
     deduped = []
     seen = set()
-    for r in cleaned:
+    for r in cleaned:        
         key = (r["Date"], round(r["Amount"], 2), r["Memo"])
         if key not in seen:
             deduped.append(r)
