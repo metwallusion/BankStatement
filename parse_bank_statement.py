@@ -272,9 +272,20 @@ def extract_fallback_lines(pdf_source) -> Tuple[List[str], Optional[str]]:
         except OSError:
             data = None
     elif hasattr(pdf_source, "read"):
-        pos = pdf_source.tell()
+        try:
+            pos = pdf_source.tell()
+        except (OSError, AttributeError):
+            pos = None
+        try:
+            pdf_source.seek(0)
+        except (OSError, AttributeError):
+            pass
         data = pdf_source.read()
-        pdf_source.seek(pos)
+        if pos is not None:
+            try:
+                pdf_source.seek(pos)
+            except (OSError, AttributeError):
+                pass
     if not data:
         return [], None
 
@@ -356,7 +367,10 @@ def parse_pdf(pdf_source):
     year_hint = infer_year_from_filename(file_name) if file_name else None
 
     if hasattr(pdf_source, "seek"):
-        pdf_source.seek(0)
+        try:
+            pdf_source.seek(0)
+        except (OSError, AttributeError):
+            pass
 
     brand = "generic"
     try:
@@ -371,6 +385,12 @@ def parse_pdf(pdf_source):
                 rows.extend(page_rows)
     except Exception:
         rows = []
+    finally:
+        if hasattr(pdf_source, "seek"):
+            try:
+                pdf_source.seek(0)
+            except (OSError, AttributeError):
+                pass
 
     # Only attempt the raw stream fallback when ``pdfplumber`` failed to
     # produce any transaction rows. This keeps the behaviour identical for
@@ -378,6 +398,11 @@ def parse_pdf(pdf_source):
     # PDFs (such as the "09 2025" file) whose text needs to be inflated from
     # compressed content streams.
     if not rows:
+        if hasattr(pdf_source, "seek"):
+            try:
+                pdf_source.seek(0)
+            except (OSError, AttributeError):
+                pass
         fallback_lines, brand_hint = extract_fallback_lines(pdf_source)
         if fallback_lines:
             brand = brand_hint or brand
