@@ -1,10 +1,12 @@
-import pdfplumber
 import csv
 import re
 import sys
+import zlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, List, Optional, Tuple
+
+import pdfplumber
 
 # Matches either ``MM/DD/YY`` or ``MM/DD`` followed by a description and amount.
 # Amounts may contain a space after ``$`` and may use a trailing ``-`` to denote
@@ -23,15 +25,24 @@ HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+ch
 MEMO_CLEAN_RE = re.compile(r"(summary|detail|closing|account|page|new\s+charges?)", re.I)
 
 
-def detect_brand(pdf) -> str:
-    # Read first couple of pages; normalize spacing for robust substring checks
-    txt = " ".join((pdf.pages[i].extract_text() or "") for i in range(min(2, len(pdf.pages)))).lower()
-    txt = re.sub(r"\s+", " ", txt)
-    if "wells fargo" in txt and ("transaction history" in txt or "deposits/ credits" in txt or "withdrawals/ debits" in txt):
+def detect_brand_from_text(text: str) -> str:
+    txt = re.sub(r"\s+", " ", text or "").lower()
+    if "wells fargo" in txt and (
+        "transaction history" in txt
+        or "deposits/ credits" in txt
+        or "withdrawals/ debits" in txt
+    ):
         return "wells"
     if "american express" in txt or "membership rewards" in txt:
         return "amex"
     return "generic"
+
+
+def detect_brand(pdf) -> str:
+    txt = " ".join(
+        (pdf.pages[i].extract_text() or "") for i in range(min(2, len(pdf.pages)))
+    )
+    return detect_brand_from_text(txt)
 
 NEGATIVE_HINTS = (
     "purchase authorized", "withdrawal", "ach debit", "zelle to",
@@ -135,10 +146,219 @@ def parse_amount_from_line(line: str, memo_so_far: str, brand: str):
     return amount, leftover
 
 
+def process_statement_lines(
+    lines: Iterable[str], brand: str, year_hint: Optional[int]
+) -> List[dict]:
+    rows: List[dict] = []
+    current_tx = None
+    current_year = year_hint
+    mode = None  # 'pattern' or 'sm'
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = pattern.search(line)
+        if match:
+            if current_tx and (
+                mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
+            ):
+                rows.append(current_tx)
+            date_full, date_short, desc, amt_str = match.groups()
+            if date_full:
+                date_dt = datetime.strptime(date_full, "%m/%d/%y")
+                current_year = date_dt.year
+            else:
+                if current_year is None:
+                    current_year = year_hint or datetime.today().year
+                date_dt = datetime.strptime(
+                    f"{date_short}/{str(current_year)[-2:]}", "%m/%d/%y"
+                )
+            date_fmt = f"{date_dt.month}/{date_dt.day}/{date_dt.year}"
+            amt_clean = (
+                amt_str.replace("$", "")
+                .replace(",", "")
+                .replace("+", "")
+                .replace("-", "")
+                .strip()
+            )
+            amount = float(amt_clean)
+            if amt_str.strip().startswith("-") or amt_str.strip().endswith("-"):
+                amount = -amount
+            current_tx = {"Date": date_fmt, "Amount": amount, "Memo": desc.strip()}
+            mode = "pattern"
+            continue
+
+        date_match = DATE_START.match(line)
+        if date_match:
+            if current_tx and (
+                mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
+            ):
+                rows.append(current_tx)
+            date_raw, rest = date_match.groups()
+            if HEADER_RE.search(rest):
+                rest = rest[: HEADER_RE.search(rest).start()]
+            rest = rest.strip()
+            date_dt = normalize_date(date_raw, current_year or year_hint)
+            current_year = date_dt.year
+            current_tx = {
+                "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
+                "Memo": rest.strip(),
+                "Amount": None,
+            }
+            mode = "sm"
+            if rest.strip():
+                desc_part = rest.strip()
+                money_match = MONEY_INLINE.search(desc_part)
+                if money_match:
+                    amt_raw = money_match.group(1)
+                    memo = desc_part[: money_match.start()].strip()
+                    current_tx["Memo"] = memo
+                    raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
+                    amount = float(raw)
+                    has_minus = "-" in amt_raw
+                    sign = guess_sign(memo, has_minus, brand)
+                    current_tx["Amount"] = amount * (-1 if sign < 0 else 1)
+                    rows.append(current_tx)
+                    current_tx = None
+                    mode = None
+                else:
+                    amt, leftover = parse_amount_from_line(desc_part, current_tx["Memo"], brand)
+                    if amt is not None:
+                        if leftover:
+                            current_tx["Memo"] = leftover
+                        current_tx["Amount"] = amt
+                        rows.append(current_tx)
+                        current_tx = None
+                        mode = None
+            continue
+
+        if mode == "pattern" and current_tx:
+            current_tx["Memo"] += " " + line
+            continue
+
+        if mode == "sm" and current_tx:
+            if HEADER_RE.search(line):
+                continue
+            amt, leftover = parse_amount_from_line(line, current_tx["Memo"], brand)
+            if amt is not None:
+                if leftover:
+                    current_tx["Memo"] = (current_tx["Memo"] + " " + leftover).strip()
+                current_tx["Amount"] = amt
+                rows.append(current_tx)
+                current_tx = None
+                mode = None
+            else:
+                current_tx["Memo"] = (current_tx["Memo"] + " " + line).strip()
+            continue
+
+        if HEADER_RE.search(line):
+            continue
+
+    if current_tx and (
+        mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
+    ):
+        rows.append(current_tx)
+
+    return rows
+
+
+def extract_fallback_lines(pdf_source) -> Tuple[List[str], Optional[str]]:
+    data: Optional[bytes] = None
+    if isinstance(pdf_source, (str, Path)):
+        try:
+            data = Path(pdf_source).read_bytes()
+        except OSError:
+            data = None
+    elif hasattr(pdf_source, "read"):
+        try:
+            pos = pdf_source.tell()
+        except (OSError, AttributeError):
+            pos = None
+        try:
+            pdf_source.seek(0)
+        except (OSError, AttributeError):
+            pass
+        data = pdf_source.read()
+        if pos is not None:
+            try:
+                pdf_source.seek(pos)
+            except (OSError, AttributeError):
+                pass
+    if not data:
+        return [], None
+
+    stream_chunks = re.findall(b"stream\r?\n(.*?)\r?\nendstream", data, re.S)
+    text_parts: List[str] = []
+    str_pat = re.compile(rb"\((.*?)\)\s*Tj", re.S)
+    arr_pat = re.compile(rb"\[(.*?)\]\s*TJ", re.S)
+    paren_pat = re.compile(rb"\((.*?)\)", re.S)
+
+    def decode_pdf_bytes(chunk: bytes) -> str:
+        return (
+            chunk.replace(b"\\(", b"(")
+            .replace(b"\\)", b")")
+            .replace(b"\\r", b" ")
+            .replace(b"\\n", b" ")
+            .replace(b"\\t", b" ")
+        ).decode("latin-1", errors="ignore")
+
+    for raw_stream in stream_chunks:
+        try:
+            content = zlib.decompress(raw_stream)
+        except Exception:
+            continue
+        for m in str_pat.finditer(content):
+            text_parts.append(decode_pdf_bytes(m.group(1)))
+        for m in arr_pat.finditer(content):
+            combined = "".join(
+                decode_pdf_bytes(part)
+                for part in paren_pat.findall(m.group(1))
+            )
+            text_parts.append(combined)
+
+    if not text_parts:
+        return [], None
+
+    full_text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
+    brand_hint = detect_brand_from_text(full_text)
+
+    txn_pattern = re.compile(
+        r"(?<![Oo]n\s)((?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{2,4})?)\s+(.*?)(?=(?<![Oo]n\s)(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{2,4})?\s+|$)",
+        re.S,
+    )
+    segments: List[Tuple[str, str]] = []
+    for match in txn_pattern.finditer(full_text):
+        date = match.group(1)
+        body = match.group(2).strip()
+        if not body:
+            continue
+        if segments and segments[-1][1].endswith(" on 0") and re.match(r"0?\d", date):
+            prev_date, prev_body = segments[-1]
+            segments[-1] = (prev_date, prev_body[:-1] + date + " " + body)
+        else:
+            segments.append((date, body))
+
+    lines: List[str] = []
+    for date, body in segments:
+        text = f"{date} {body}".strip()
+        lower = text.lower()
+        for marker in ("totals", "transaction history", "monthly service fee"):
+            if marker in lower:
+                text = text[: lower.index(marker)].strip()
+                lower = text.lower()
+        if not text or not MONEY_INLINE.search(text):
+            continue
+        lines.append(text)
+
+    return lines, brand_hint
+
+
 def parse_pdf(pdf_source):
     """Parse a bank statement PDF supporting multiple layouts."""
 
-    rows = []
+    rows: List[dict] = []
     file_name = None
     if isinstance(pdf_source, (str, Path)):
         file_name = str(pdf_source)
@@ -147,121 +367,46 @@ def parse_pdf(pdf_source):
     year_hint = infer_year_from_filename(file_name) if file_name else None
 
     if hasattr(pdf_source, "seek"):
-        pdf_source.seek(0)
+        try:
+            pdf_source.seek(0)
+        except (OSError, AttributeError):
+            pass
 
-    with pdfplumber.open(pdf_source) as pdf:
-        brand = detect_brand(pdf)
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-            lines = text.split("\n")
-            current_tx = None
-            current_year = year_hint
-            mode = None  # 'pattern' or 'sm'
-
-            for raw_line in lines:
-                line = raw_line.strip()
-                if not line:
+    brand = "generic"
+    try:
+        with pdfplumber.open(pdf_source) as pdf:
+            if pdf.pages:
+                brand = detect_brand(pdf)
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text:
                     continue
+                page_rows = process_statement_lines(text.split("\n"), brand, year_hint)
+                rows.extend(page_rows)
+    except Exception:
+        rows = []
+    finally:
+        if hasattr(pdf_source, "seek"):
+            try:
+                pdf_source.seek(0)
+            except (OSError, AttributeError):
+                pass
 
-                match = pattern.search(line)
-                if match:
-                    if current_tx:
-                        if mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None):
-                            rows.append(current_tx)
-                    date_full, date_short, desc, amt_str = match.groups()
-                    if date_full:
-                        date_dt = datetime.strptime(date_full, "%m/%d/%y")
-                        current_year = date_dt.year
-                    else:
-                        if current_year is None:
-                            current_year = year_hint or datetime.today().year
-                        date_dt = datetime.strptime(
-                            f"{date_short}/{str(current_year)[-2:]}", "%m/%d/%y"
-                        )
-                    date_fmt = f"{date_dt.month}/{date_dt.day}/{date_dt.year}"
-                    amt_clean = (
-                        amt_str.replace("$", "")
-                        .replace(",", "")
-                        .replace("+", "")
-                        .replace("-", "")
-                        .strip()
-                    )
-                    amount = float(amt_clean)
-                    if amt_str.strip().startswith("-") or amt_str.strip().endswith("-"):
-                        amount = -amount
-                    current_tx = {"Date": date_fmt, "Amount": amount, "Memo": desc.strip()}
-                    mode = "pattern"
-                    continue
-
-                date_match = DATE_START.match(line)
-                if date_match:
-                    if current_tx:
-                        if mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None):
-                            rows.append(current_tx)
-                    date_raw, rest = date_match.groups()
-                    if HEADER_RE.search(rest):
-                        rest = rest[:HEADER_RE.search(rest).start()]
-                    rest = rest.strip()
-                    date_dt = normalize_date(date_raw, current_year or year_hint)
-                    current_year = date_dt.year
-                    current_tx = {
-                        "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
-                        "Memo": rest.strip(),
-                        "Amount": None,
-                    }
-                    mode = "sm"
-                    if rest.strip():
-                        desc_part = rest.strip()
-                        money_match = MONEY_INLINE.search(desc_part)
-                        if money_match:
-                            amt_raw = money_match.group(1)
-                            memo = desc_part[: money_match.start()].strip()
-                            current_tx["Memo"] = memo
-                            raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
-                            amount = float(raw)
-                            has_minus = "-" in amt_raw
-                            sign = guess_sign(memo, has_minus, brand)
-                            current_tx["Amount"] = amount * (-1 if sign < 0 else 1)
-                            rows.append(current_tx)
-                            current_tx = None
-                            mode = None
-                        else:
-                            amt, leftover = parse_amount_from_line(desc_part, current_tx["Memo"], brand)
-                            if amt is not None:
-                                if leftover:
-                                    current_tx["Memo"] = leftover
-                                current_tx["Amount"] = amt
-                                rows.append(current_tx)
-                                current_tx = None
-                                mode = None
-                    continue
-
-                if mode == "pattern" and current_tx:
-                    current_tx["Memo"] += " " + line
-                    continue
-
-                if mode == "sm" and current_tx:
-                    if HEADER_RE.search(line):
-                        continue
-                    amt, leftover = parse_amount_from_line(line, current_tx["Memo"], brand)
-                    if amt is not None:
-                        if leftover:
-                            current_tx["Memo"] = (current_tx["Memo"] + " " + leftover).strip()
-                        current_tx["Amount"] = amt
-                        rows.append(current_tx)
-                        current_tx = None
-                        mode = None
-                    else:
-                        current_tx["Memo"] = (current_tx["Memo"] + " " + line).strip()
-                    continue
-
-                if HEADER_RE.search(line):
-                    continue
-
-            if current_tx and (mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)):
-                rows.append(current_tx)
+    # Only attempt the raw stream fallback when ``pdfplumber`` failed to
+    # produce any transaction rows. This keeps the behaviour identical for
+    # statements that already parse correctly while still rescuing edge-case
+    # PDFs (such as the "09 2025" file) whose text needs to be inflated from
+    # compressed content streams.
+    if not rows:
+        if hasattr(pdf_source, "seek"):
+            try:
+                pdf_source.seek(0)
+            except (OSError, AttributeError):
+                pass
+        fallback_lines, brand_hint = extract_fallback_lines(pdf_source)
+        if fallback_lines:
+            brand = brand_hint or brand
+            rows = process_statement_lines(fallback_lines, brand, year_hint)
 
     cleaned = []
     for r in rows:
