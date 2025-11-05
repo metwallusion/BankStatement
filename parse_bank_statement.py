@@ -260,14 +260,19 @@ def process_statement_lines(
             month_abbrev, day, rest = abbrev_match.groups()
             rest = rest.strip()
             
-            # Skip post date (second date), reference number, and extract description + amount
-            # Format: Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99
-            # Or: Aug28 Aug28 LATEPAYMENTFEE 29.00 (no numeric ref number)
-            parts = rest.split(None, 2)  # Split into max 3 parts
+            # Parse tabular format with abbreviated month dates:
+            # Format 1: Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99
+            #           ^ActivityDate ^PostDate ^RefNum ^Description... ^Amount
+            # Format 2: Aug28 Aug28 LATEPAYMENTFEE 29.00 (no numeric reference number)
+            #           ^ActivityDate ^PostDate ^Description ^Amount
+            # Split into at most 3 parts: post date, ref/desc, desc+amount
+            parts = rest.split(None, 2)
             if len(parts) >= 3:
-                # Check if second part (after post date) is a numeric reference number
+                # Check if second part (after post date) is a numeric reference number.
+                # Reference numbers in these statements are purely numeric (e.g., 33739422).
+                # Non-numeric values (e.g., LATEPAYMENTFEE) are part of the description.
                 if parts[1].isdigit():
-                    # Regular format with reference number
+                    # Regular format with numeric reference number
                     desc_and_amount = parts[2]
                 else:
                     # No reference number, second part is description start
