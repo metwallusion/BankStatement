@@ -262,12 +262,18 @@ def process_statement_lines(
             
             # Skip post date (second date), reference number, and extract description + amount
             # Format: Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99
+            # Or: Aug28 Aug28 LATEPAYMENTFEE 29.00 (no numeric ref number)
             parts = rest.split(None, 2)  # Split into max 3 parts
             if len(parts) >= 3:
-                # Skip the post date and reference number (first two parts)
-                desc_and_amount = parts[2]
+                # Check if second part (after post date) is a numeric reference number
+                if parts[1].isdigit():
+                    # Regular format with reference number
+                    desc_and_amount = parts[2]
+                else:
+                    # No reference number, second part is description start
+                    desc_and_amount = ' '.join(parts[1:])
             elif len(parts) == 2:
-                # Just reference and description+amount
+                # Just post date and description+amount (or description and amount)
                 desc_and_amount = parts[1]
             else:
                 desc_and_amount = rest
