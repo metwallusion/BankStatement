@@ -17,11 +17,13 @@ pattern = re.compile(
 
 # Additional patterns for multi-line and tabular statements
 DATE_START = re.compile(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\*?\b(.*)$")
+# Pattern for abbreviated month format: Aug02, Sep01, etc.
+ABBREV_MONTH_DATE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{2})\b(.*)$")
 MONEY_INLINE = re.compile(r"(-?\$?\s?\d[\d,]*\.\d{2})")
 AMOUNT_ONLY = re.compile(r"^\s*-?\$?\s?\d[\d,]*\.\d{2}(?:\s*[⧫♦])?\s*$")
 AMOUNT_WITH_BALANCE = re.compile(r"^\s*(-?\$?\s?\d[\d,]*\.\d{2})\s+[\d,]*\.\d{2}\s*$")
 MONEY_STRIPPER = re.compile(r"[^\d.\-]")
-HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+charges?)", re.I)
+HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+charges?|transactions|activity date|postdate|reference)", re.I)
 MEMO_CLEAN_RE = re.compile(r"(summary|detail|closing|account|page|new\s+charges?)", re.I)
 
 
@@ -83,6 +85,20 @@ def normalize_date(ds: str, year_hint: Optional[int]) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized date: {ds}")
+
+
+def parse_abbreviated_month_date(month_abbrev: str, day: str, year_hint: Optional[int]) -> datetime:
+    """Parse abbreviated month date format like 'Aug02' to datetime."""
+    month_map = {
+        'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+        'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+    }
+    if year_hint is None:
+        year_hint = datetime.today().year
+    month = month_map.get(month_abbrev)
+    if month is None:
+        raise ValueError(f"Invalid month abbreviation: {month_abbrev}")
+    return datetime(year_hint, month, int(day))
 
 
 def clean_amount_str(s: str) -> float:
@@ -232,6 +248,51 @@ def process_statement_lines(
                         rows.append(current_tx)
                         current_tx = None
                         mode = None
+            continue
+
+        # Check for abbreviated month format (e.g., "Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99")
+        abbrev_match = ABBREV_MONTH_DATE.match(line)
+        if abbrev_match:
+            if current_tx and (
+                mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
+            ):
+                rows.append(current_tx)
+            month_abbrev, day, rest = abbrev_match.groups()
+            rest = rest.strip()
+            
+            # Skip post date (second date), reference number, and extract description + amount
+            # Format: Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99
+            parts = rest.split(None, 2)  # Split into max 3 parts
+            if len(parts) >= 3:
+                # Skip the post date and reference number (first two parts)
+                desc_and_amount = parts[2]
+            elif len(parts) == 2:
+                # Just reference and description+amount
+                desc_and_amount = parts[1]
+            else:
+                desc_and_amount = rest
+            
+            date_dt = parse_abbreviated_month_date(month_abbrev, day, current_year or year_hint)
+            current_year = date_dt.year
+            
+            # Extract amount from the end of the line
+            money_match = MONEY_INLINE.search(desc_and_amount)
+            if money_match:
+                amt_raw = money_match.group(1)
+                memo = desc_and_amount[: money_match.start()].strip()
+                raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
+                amount = float(raw)
+                has_minus = "-" in amt_raw
+                sign = guess_sign(memo, has_minus, brand)
+                
+                current_tx = {
+                    "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
+                    "Memo": memo,
+                    "Amount": amount * (-1 if sign < 0 else 1)
+                }
+                rows.append(current_tx)
+                current_tx = None
+                mode = None
             continue
 
         if mode == "pattern" and current_tx:
