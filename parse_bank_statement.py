@@ -16,11 +16,14 @@ pattern = re.compile(
 )
 
 # Additional patterns for multi-line and tabular statements
+MONTH_ABBREVS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 DATE_START = re.compile(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\*?\b(.*)$")
 # Pattern for abbreviated month format: Aug02, Sep01, etc.
-ABBREV_MONTH_DATE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{2})\b(.*)$")
+ABBREV_MONTH_DATE = re.compile(rf"^({MONTH_ABBREVS})(\d{{2}})\b(.*)$")
 # Pattern for month with space and day: "Jul 14", "Apr 11", etc.
-MONTH_SPACE_DAY = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b(.*)$")
+MONTH_SPACE_DAY = re.compile(rf"^({MONTH_ABBREVS})\s+(\d{{1,2}})\b(.*)$")
+# Pattern to detect and skip a post date in tabular formats
+POST_DATE_PATTERN = re.compile(rf"^({MONTH_ABBREVS})\s+(\d{{1,2}})\s+(.*)$")
 MONEY_INLINE = re.compile(r"(-?\$?\s?\d[\d,]*\.\d{2})")
 AMOUNT_ONLY = re.compile(r"^\s*-?\$?\s?\d[\d,]*\.\d{2}(?:\s*[⧫♦])?\s*$")
 AMOUNT_WITH_BALANCE = re.compile(r"^\s*(-?\$?\s?\d[\d,]*\.\d{2})\s+[\d,]*\.\d{2}\s*$")
@@ -115,6 +118,13 @@ def clean_amount_str(s: str) -> float:
         raise ValueError("Empty monetary value")
     amount = float(cleaned)
     return -amount if negative else amount
+
+
+def clean_memo_text(memo: str) -> str:
+    """Remove common non-descriptive markers from memo text."""
+    # Remove N/A markers commonly found in tabular statements
+    memo = re.sub(r'\bN/A\b', '', memo).strip()
+    return memo
 
 
 def should_skip_wellsfargo_continuation_line(line: str) -> bool:
@@ -381,8 +391,7 @@ def process_statement_lines(
             # Format 2: Apr 10 Apr 11 BH* REGAIN.USBETTERHELP.OCA $15.00
             #           ^TransDate ^PostDate ^Description ^Amount
             # Check if rest starts with another month-day pattern (the post date)
-            post_date_pattern = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(.*)$")
-            post_match = post_date_pattern.match(rest)
+            post_match = POST_DATE_PATTERN.match(rest)
             if post_match:
                 # Skip the post date and use the remaining as description
                 desc_and_amount = post_match.group(3).strip()
@@ -394,13 +403,11 @@ def process_statement_lines(
             current_year = date_dt.year
             
             # Extract amount from the end of the line
-            # Look for amount, handling negative signs and N/A markers
             money_match = MONEY_INLINE.search(desc_and_amount)
             if money_match:
                 amt_raw = money_match.group(1)
                 memo = desc_and_amount[: money_match.start()].strip()
-                # Remove N/A or other non-amount markers from memo
-                memo = re.sub(r'\bN/A\b', '', memo).strip()
+                memo = clean_memo_text(memo)
                 raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
                 amount = float(raw)
                 has_minus = "-" in amt_raw
