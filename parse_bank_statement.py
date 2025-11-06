@@ -115,6 +115,37 @@ def clean_amount_str(s: str) -> float:
     return -amount if negative else amount
 
 
+def should_skip_wellsfargo_continuation_line(line: str) -> bool:
+    """
+    Determine if a line should be skipped when processing Wells Fargo continuation lines.
+    
+    Wells Fargo statements have continuation lines after transactions, but also include
+    summary tables, column headers, and boilerplate text that should be filtered out.
+    
+    Returns True if the line should be skipped (is not a legitimate continuation line).
+    """
+    stripped = line.strip()
+    
+    # Skip if line matches table/summary patterns:
+    # - Starts with number + date pattern (like "1084 8/4 563.70")
+    # - Contains column headers (like "Number Date Amount")
+    # - Starts with bullet point or special chars (like "•")
+    # - Contains fees/charges summary info
+    # - Is mostly symbols (like "÷")
+    # - Contains URLs or boilerplate text
+    return (
+        re.match(r'^\d+\s+\d{1,2}/\d{1,2}', stripped) or
+        re.match(r'^(Number|Date|Amount|Units|Service|Description|Fee)', stripped, re.I) or
+        re.match(r'^[•÷\-]{1,3}\s', stripped) or
+        'fee period' in stripped.lower() or
+        'service charge' in stripped.lower() or
+        'wellsfargo.com' in stripped.lower() or
+        'for a link to' in stripped.lower() or
+        stripped in ['', 'C1/C1'] or
+        re.match(r'^[\d\$\.,\s÷•]+$', stripped)  # Line with only numbers, $, commas, dots, spaces, symbols
+    )
+
+
 def guess_sign(desc: str, amount_has_minus: bool, brand: str) -> int:
     d = desc.lower()
     if brand == "amex" and amount_has_minus and ("credit" in d or "refund" in d):
@@ -325,18 +356,7 @@ def process_statement_lines(
             # For Wells Fargo, if transaction already has an amount, don't parse amounts from continuation lines
             # Just append the line to the memo (after filtering out obvious non-description content)
             if brand == "wells" and current_tx.get("Amount") is not None:
-                # Skip lines that look like table data or reference info
-                stripped = line.strip()
-                # Skip if line matches table/summary patterns
-                if (re.match(r'^\d+\s+\d{1,2}/\d{1,2}', stripped) or
-                    re.match(r'^(Number|Date|Amount|Units|Service|Description|Fee)', stripped, re.I) or
-                    re.match(r'^[•÷\-]{1,3}\s', stripped) or
-                    'fee period' in stripped.lower() or
-                    'service charge' in stripped.lower() or
-                    'wellsfargo.com' in stripped.lower() or
-                    'for a link to' in stripped.lower() or
-                    stripped in ['', 'C1/C1'] or
-                    re.match(r'^[\d\$\.,\s÷•]+$', stripped)):
+                if should_skip_wellsfargo_continuation_line(line):
                     continue
                 # Include legitimate continuation lines (card info, ATM IDs, reference numbers, locations, etc.)
                 current_tx["Memo"] = (current_tx["Memo"] + " " + line).strip()
