@@ -21,8 +21,10 @@ DATE_START = re.compile(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\*?\b(.*)$")
 # Pattern for abbreviated month format: Aug02, Sep01, etc.
 ABBREV_MONTH_DATE = re.compile(rf"^({MONTH_ABBREVS})(\d{{2}})\b(.*)$")
 # Pattern for month with space and day: "Jul 14", "Apr 11", etc.
+# Uses \b (word boundary) to match the entire line starting with a date
 MONTH_SPACE_DAY = re.compile(rf"^({MONTH_ABBREVS})\s+(\d{{1,2}})\b(.*)$")
-# Pattern to detect and skip a post date in tabular formats
+# Pattern to detect and skip a post date within the line content
+# Uses \s+ after day to ensure we capture the rest of the line after the post date
 POST_DATE_PATTERN = re.compile(rf"^({MONTH_ABBREVS})\s+(\d{{1,2}})\s+(.*)$")
 MONEY_INLINE = re.compile(r"(-?\$?\s?\d[\d,]*\.\d{2})")
 AMOUNT_ONLY = re.compile(r"^\s*-?\$?\s?\d[\d,]*\.\d{2}(?:\s*[⧫♦])?\s*$")
