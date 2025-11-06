@@ -19,6 +19,8 @@ pattern = re.compile(
 DATE_START = re.compile(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\*?\b(.*)$")
 # Pattern for abbreviated month format: Aug02, Sep01, etc.
 ABBREV_MONTH_DATE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{2})\b(.*)$")
+# Pattern for month with space and day: "Jul 14", "Apr 11", etc.
+MONTH_SPACE_DAY = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b(.*)$")
 MONEY_INLINE = re.compile(r"(-?\$?\s?\d[\d,]*\.\d{2})")
 AMOUNT_ONLY = re.compile(r"^\s*-?\$?\s?\d[\d,]*\.\d{2}(?:\s*[⧫♦])?\s*$")
 AMOUNT_WITH_BALANCE = re.compile(r"^\s*(-?\$?\s?\d[\d,]*\.\d{2})\s+[\d,]*\.\d{2}\s*$")
@@ -348,6 +350,57 @@ def process_statement_lines(
             if money_match:
                 amt_raw = money_match.group(1)
                 memo = desc_and_amount[: money_match.start()].strip()
+                raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
+                amount = float(raw)
+                has_minus = "-" in amt_raw
+                sign = guess_sign(memo, has_minus, brand)
+                
+                current_tx = {
+                    "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
+                    "Memo": memo,
+                    "Amount": amount * (-1 if sign < 0 else 1)
+                }
+                rows.append(current_tx)
+                current_tx = None
+                mode = None
+            continue
+
+        # Check for month with space and day format (e.g., "Jul 14 Jul 14 Payment Received THE FIDELITY N/A -$99.00")
+        month_space_match = MONTH_SPACE_DAY.match(line)
+        if month_space_match:
+            if current_tx and (
+                mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
+            ):
+                rows.append(current_tx)
+            month_abbrev, day, rest = month_space_match.groups()
+            rest = rest.strip()
+            
+            # Parse tabular format with spaced month dates:
+            # Format 1: Jul 14 Jul 14 Payment Received THE FIDELITY N/A -$99.00
+            #           ^TransDate ^PostDate ^Description... ^Amount
+            # Format 2: Apr 10 Apr 11 BH* REGAIN.USBETTERHELP.OCA $15.00
+            #           ^TransDate ^PostDate ^Description ^Amount
+            # Check if rest starts with another month-day pattern (the post date)
+            post_date_pattern = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(.*)$")
+            post_match = post_date_pattern.match(rest)
+            if post_match:
+                # Skip the post date and use the remaining as description
+                desc_and_amount = post_match.group(3).strip()
+            else:
+                # No post date found, use everything as description
+                desc_and_amount = rest
+            
+            date_dt = parse_abbreviated_month_date(month_abbrev, day, current_year or year_hint)
+            current_year = date_dt.year
+            
+            # Extract amount from the end of the line
+            # Look for amount, handling negative signs and N/A markers
+            money_match = MONEY_INLINE.search(desc_and_amount)
+            if money_match:
+                amt_raw = money_match.group(1)
+                memo = desc_and_amount[: money_match.start()].strip()
+                # Remove N/A or other non-amount markers from memo
+                memo = re.sub(r'\bN/A\b', '', memo).strip()
                 raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
                 amount = float(raw)
                 has_minus = "-" in amt_raw
