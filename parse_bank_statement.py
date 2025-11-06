@@ -23,7 +23,7 @@ MONEY_INLINE = re.compile(r"(-?\$?\s?\d[\d,]*\.\d{2})")
 AMOUNT_ONLY = re.compile(r"^\s*-?\$?\s?\d[\d,]*\.\d{2}(?:\s*[⧫♦])?\s*$")
 AMOUNT_WITH_BALANCE = re.compile(r"^\s*(-?\$?\s?\d[\d,]*\.\d{2})\s+[\d,]*\.\d{2}\s*$")
 MONEY_STRIPPER = re.compile(r"[^\d.\-]")
-HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+charges?|transactions|activity date|postdate|reference)", re.I)
+HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+charges?|transactions|activity date|postdate|reference|totals)", re.I)
 MEMO_CLEAN_RE = re.compile(r"(summary|detail|closing|account|page|new\s+charges?)", re.I)
 
 
@@ -113,6 +113,37 @@ def clean_amount_str(s: str) -> float:
         raise ValueError("Empty monetary value")
     amount = float(cleaned)
     return -amount if negative else amount
+
+
+def should_skip_wellsfargo_continuation_line(line: str) -> bool:
+    """
+    Determine if a line should be skipped when processing Wells Fargo continuation lines.
+    
+    Wells Fargo statements have continuation lines after transactions, but also include
+    summary tables, column headers, and boilerplate text that should be filtered out.
+    
+    Returns True if the line should be skipped (is not a legitimate continuation line).
+    """
+    stripped = line.strip()
+    
+    # Skip if line matches table/summary patterns:
+    # - Starts with number + date pattern (like "1084 8/4 563.70")
+    # - Contains column headers (like "Number Date Amount")
+    # - Starts with bullet point or special chars (like "•")
+    # - Contains fees/charges summary info
+    # - Is mostly symbols (like "÷")
+    # - Contains URLs or boilerplate text
+    return (
+        re.match(r'^\d+\s+\d{1,2}/\d{1,2}', stripped) or
+        re.match(r'^(Number|Date|Amount|Units|Service|Description|Fee)', stripped, re.I) or
+        re.match(r'^[•÷\-]{1,3}\s', stripped) or
+        'fee period' in stripped.lower() or
+        'service charge' in stripped.lower() or
+        'wellsfargo.com' in stripped.lower() or
+        'for a link to' in stripped.lower() or
+        stripped in ['', 'C1/C1'] or
+        re.match(r'^[\d\$\.,\s÷•]+$', stripped)  # Line with only numbers, $, commas, dots, spaces, symbols
+    )
 
 
 def guess_sign(desc: str, amount_has_minus: bool, brand: str) -> int:
@@ -236,18 +267,22 @@ def process_statement_lines(
                     has_minus = "-" in amt_raw
                     sign = guess_sign(memo, has_minus, brand)
                     current_tx["Amount"] = amount * (-1 if sign < 0 else 1)
-                    rows.append(current_tx)
-                    current_tx = None
-                    mode = None
+                    # For Wells Fargo, keep transaction active to capture continuation lines
+                    if brand != "wells":
+                        rows.append(current_tx)
+                        current_tx = None
+                        mode = None
                 else:
                     amt, leftover = parse_amount_from_line(desc_part, current_tx["Memo"], brand)
                     if amt is not None:
                         if leftover:
                             current_tx["Memo"] = leftover
                         current_tx["Amount"] = amt
-                        rows.append(current_tx)
-                        current_tx = None
-                        mode = None
+                        # For Wells Fargo, keep transaction active to capture continuation lines
+                        if brand != "wells":
+                            rows.append(current_tx)
+                            current_tx = None
+                            mode = None
             continue
 
         # Check for abbreviated month format (e.g., "Aug02 Aug04 33739422 DNH*SUCURIWEBSITE SECURI888-8730817 9.99")
@@ -312,7 +347,21 @@ def process_statement_lines(
 
         if mode == "sm" and current_tx:
             if HEADER_RE.search(line):
+                # For Wells Fargo, if we hit certain end-of-section markers (like "Totals"), finalize the current transaction
+                if brand == "wells" and current_tx.get("Amount") is not None and re.search(r'\btotals\b', line, re.I):
+                    rows.append(current_tx)
+                    current_tx = None
+                    mode = None
                 continue
+            # For Wells Fargo, if transaction already has an amount, don't parse amounts from continuation lines
+            # Just append the line to the memo (after filtering out obvious non-description content)
+            if brand == "wells" and current_tx.get("Amount") is not None:
+                if should_skip_wellsfargo_continuation_line(line):
+                    continue
+                # Include legitimate continuation lines (card info, ATM IDs, reference numbers, locations, etc.)
+                current_tx["Memo"] = (current_tx["Memo"] + " " + line).strip()
+                continue
+            
             amt, leftover = parse_amount_from_line(line, current_tx["Memo"], brand)
             if amt is not None:
                 if leftover:
