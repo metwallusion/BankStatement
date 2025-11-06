@@ -121,7 +121,11 @@ def clean_amount_str(s: str) -> float:
 
 
 def clean_memo_text(memo: str) -> str:
-    """Remove common non-descriptive markers from memo text."""
+    """Remove common non-descriptive markers from memo text.
+    
+    Currently removes:
+    - 'N/A' markers commonly found in tabular statements (Frontier, etc.)
+    """
     # Remove N/A markers commonly found in tabular statements
     memo = re.sub(r'\bN/A\b', '', memo).strip()
     return memo
