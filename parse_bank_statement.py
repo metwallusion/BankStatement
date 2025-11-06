@@ -222,10 +222,26 @@ def process_statement_lines(
     current_year = year_hint
     mode = None  # 'pattern' or 'sm'
     prev_line = None  # Track previous line for PayPal format
+    skip_balance_summary = False  # Skip lines after balance summary header
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+        
+        # Check if we're entering a balance summary or totals section
+        if re.search(r'\b(balance\s+summary|daily\s+balance|totals?\s+(amount|other))\b', line, re.I):
+            skip_balance_summary = True
+            prev_line = line
+            continue
+        
+        # Reset skip flag if we see a new section header
+        if skip_balance_summary and HEADER_RE.search(line) and not re.search(r'\b(balance|total|date)\b', line, re.I):
+            skip_balance_summary = False
+        
+        # Skip lines in balance summary/totals sections
+        if skip_balance_summary:
+            prev_line = line
             continue
 
         match = pattern.search(line)
