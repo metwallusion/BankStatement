@@ -213,6 +213,21 @@ def process_statement_lines(
             ):
                 rows.append(current_tx)
             date_full, date_short, desc, amt_str = match.groups()
+            
+            # For Wells Fargo, check if description contains an amount (transaction amount)
+            # If so, that's the real amount and amt_str is the ending balance
+            wells_fargo_tx_amount = False
+            if brand == "wells":
+                desc_money_match = MONEY_INLINE.search(desc)
+                if desc_money_match:
+                    # Extract the transaction amount from description
+                    transaction_amt = desc_money_match.group(1)
+                    # Clean description to remove the transaction amount
+                    desc = desc[:desc_money_match.start()].strip()
+                    # Use the transaction amount instead of the ending balance
+                    amt_str = transaction_amt
+                    wells_fargo_tx_amount = True
+            
             if date_full:
                 date_dt = datetime.strptime(date_full, "%m/%d/%y")
                 current_year = date_dt.year
@@ -231,8 +246,15 @@ def process_statement_lines(
                 .strip()
             )
             amount = float(amt_clean)
+            
+            # Determine sign
             if amt_str.strip().startswith("-") or amt_str.strip().endswith("-"):
                 amount = -amount
+            elif wells_fargo_tx_amount:
+                # For Wells Fargo, apply sign based on transaction description
+                sign = guess_sign(desc, False, brand)
+                amount = amount * sign
+                
             current_tx = {"Date": date_fmt, "Amount": amount, "Memo": desc.strip()}
             mode = "pattern"
             continue
