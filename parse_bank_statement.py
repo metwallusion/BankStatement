@@ -44,6 +44,9 @@ def detect_brand_from_text(text: str) -> str:
         return "wells"
     if "american express" in txt or "membership rewards" in txt:
         return "amex"
+    # PayPal detection: look for "paypal" and either "transaction history" or "merchant account"
+    if "paypal" in txt and ("transaction history" in txt or "merchant account" in txt):
+        return "paypal"
     return "generic"
 
 
@@ -218,6 +221,7 @@ def process_statement_lines(
     current_tx = None
     current_year = year_hint
     mode = None  # 'pattern' or 'sm'
+    prev_line = None  # Track previous line for PayPal format
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -289,9 +293,31 @@ def process_statement_lines(
             rest = rest.strip()
             date_dt = normalize_date(date_raw, current_year or year_hint)
             current_year = date_dt.year
+            
+            # For PayPal, check if previous line contains the description
+            # PayPal transactions have description on previous line, and current line may only have amounts
+            memo_text = rest.strip()
+            if brand == "paypal" and prev_line:
+                # Check if rest starts with an amount (no meaningful description at the start)
+                # and previous line is not a header or ID line
+                rest_starts_with_amount = False
+                if rest:
+                    first_token = rest.split(None, 1)[0] if rest.split() else ''
+                    rest_starts_with_amount = bool(re.match(r'^-?\$?[\d,]+\.?\d*$', first_token))
+                
+                # For PayPal, be more lenient with headers - only skip actual table headers
+                # PayPal uses "Payment" and "Deposit" in descriptions, which are not headers
+                prev_is_header = (prev_line.strip() in ('Date Description Name \\ Email Gross Fee Net', 
+                                                          'Transaction History - USD',
+                                                          'Merchant Account ID:'))
+                prev_is_description = prev_line and not prev_is_header and "ID:" not in prev_line
+                
+                if rest_starts_with_amount and prev_is_description:
+                    memo_text = prev_line.strip()
+            
             current_tx = {
                 "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
-                "Memo": rest.strip(),
+                "Memo": memo_text,
                 "Amount": None,
             }
             mode = "sm"
@@ -301,6 +327,9 @@ def process_statement_lines(
                 if money_match:
                     amt_raw = money_match.group(1)
                     memo = desc_part[: money_match.start()].strip()
+                    # For PayPal, if memo from rest is empty but we have memo from prev_line, keep it
+                    if not memo and memo_text:
+                        memo = memo_text
                     current_tx["Memo"] = memo
                     raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
                     amount = float(raw)
@@ -463,7 +492,11 @@ def process_statement_lines(
             continue
 
         if HEADER_RE.search(line):
+            prev_line = line
             continue
+        
+        # Track previous line for PayPal format
+        prev_line = line
 
     if current_tx and (
         mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
