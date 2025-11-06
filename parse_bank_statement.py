@@ -221,11 +221,11 @@ def process_statement_lines(
                 desc_money_match = MONEY_INLINE.search(desc)
                 if desc_money_match:
                     # Extract the transaction amount from description
-                    transaction_amt = desc_money_match.group(1)
+                    transaction_amt_str = desc_money_match.group(1)
                     # Clean description to remove the transaction amount
                     desc = desc[:desc_money_match.start()].strip()
                     # Use the transaction amount instead of the ending balance
-                    amt_str = transaction_amt
+                    amt_str = transaction_amt_str
                     wells_fargo_tx_amount = True
             
             if date_full:
