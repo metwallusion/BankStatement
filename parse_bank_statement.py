@@ -32,6 +32,15 @@ AMOUNT_WITH_BALANCE = re.compile(r"^\s*(-?\$?\s?\d[\d,]*\.\d{2})\s+[\d,]*\.\d{2}
 MONEY_STRIPPER = re.compile(r"[^\d.\-]")
 HEADER_RE = re.compile(r"(detail|summary|payments?|closing|account|page|new\s+charges?|transactions|activity date|postdate|reference|totals)", re.I)
 MEMO_CLEAN_RE = re.compile(r"(summary|detail|closing|account|page|new\s+charges?)", re.I)
+# Pattern to detect balance summary and totals sections
+BALANCE_SUMMARY_RE = re.compile(r'\b(balance\s+summary|daily\s+balance|totals?\s+(amount|other))\b', re.I)
+# Pattern for section headers that indicate end of balance summary
+SECTION_RESET_RE = re.compile(r'\b(balance|total|date)\b', re.I)
+# PayPal table headers to skip
+PAYPAL_HEADERS = ('Date Description Name \\ Email Gross Fee Net', 
+                  'Transaction History - USD',
+                  'Merchant Account ID:')
+
 
 
 def detect_brand_from_text(text: str) -> str:
@@ -44,6 +53,9 @@ def detect_brand_from_text(text: str) -> str:
         return "wells"
     if "american express" in txt or "membership rewards" in txt:
         return "amex"
+    # PayPal detection: look for "paypal" and either "transaction history" or "merchant account"
+    if "paypal" in txt and ("transaction history" in txt or "merchant account" in txt):
+        return "paypal"
     return "generic"
 
 
@@ -218,10 +230,27 @@ def process_statement_lines(
     current_tx = None
     current_year = year_hint
     mode = None  # 'pattern' or 'sm'
+    prev_line = None  # Track previous line for PayPal format
+    skip_balance_summary = False  # Skip lines after balance summary header
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+        
+        # Check if we're entering a balance summary or totals section
+        if BALANCE_SUMMARY_RE.search(line):
+            skip_balance_summary = True
+            prev_line = line
+            continue
+        
+        # Reset skip flag if we see a new section header
+        if skip_balance_summary and HEADER_RE.search(line) and not SECTION_RESET_RE.search(line):
+            skip_balance_summary = False
+        
+        # Skip lines in balance summary/totals sections
+        if skip_balance_summary:
+            prev_line = line
             continue
 
         match = pattern.search(line)
@@ -289,9 +318,30 @@ def process_statement_lines(
             rest = rest.strip()
             date_dt = normalize_date(date_raw, current_year or year_hint)
             current_year = date_dt.year
+            
+            # For PayPal, check if previous line contains the description
+            # PayPal transactions have description on previous line, and current line may only have amounts
+            memo_text = rest.strip()
+            if brand == "paypal" and prev_line:
+                # Check if rest starts with an amount (no meaningful description at the start)
+                # and previous line is not a header or ID line
+                rest_starts_with_amount = False
+                if rest:
+                    first_token = rest.split(None, 1)[0] if rest.split() else ''
+                    # Match amounts with exactly 2 decimal places or no decimal places
+                    rest_starts_with_amount = bool(re.match(r'^-?\$?[\d,]+(?:\.\d{2})?$', first_token))
+                
+                # For PayPal, be more lenient with headers - only skip actual table headers
+                # PayPal uses "Payment" and "Deposit" in descriptions, which are not headers
+                prev_is_header = prev_line.strip() in PAYPAL_HEADERS
+                prev_is_description = prev_line and not prev_is_header and "ID:" not in prev_line
+                
+                if rest_starts_with_amount and prev_is_description:
+                    memo_text = prev_line.strip()
+            
             current_tx = {
                 "Date": f"{date_dt.month}/{date_dt.day}/{date_dt.year}",
-                "Memo": rest.strip(),
+                "Memo": memo_text,
                 "Amount": None,
             }
             mode = "sm"
@@ -301,6 +351,9 @@ def process_statement_lines(
                 if money_match:
                     amt_raw = money_match.group(1)
                     memo = desc_part[: money_match.start()].strip()
+                    # For PayPal, if memo from rest is empty but we have memo from prev_line, keep it
+                    if not memo and memo_text:
+                        memo = memo_text
                     current_tx["Memo"] = memo
                     raw = MONEY_STRIPPER.sub("", amt_raw).replace("-", "")
                     amount = float(raw)
@@ -463,7 +516,11 @@ def process_statement_lines(
             continue
 
         if HEADER_RE.search(line):
+            prev_line = line
             continue
+        
+        # Track previous line for PayPal format
+        prev_line = line
 
     if current_tx and (
         mode == "pattern" or (mode == "sm" and current_tx.get("Amount") is not None)
