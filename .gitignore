@@ -3,3 +3,4 @@ venv
 dist
 build
 __pycache__
+test_streamlit_state.py
