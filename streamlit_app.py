@@ -50,7 +50,8 @@ if uploads:
                 if st.button("Flip Signs", key=f"flip_{uploaded.name}"):
                     st.session_state[editor_key].loc[st.session_state[editor_key]["Selected"], "Amount"] *= -1
 
-            df_state = st.data_editor(st.session_state[editor_key], key=editor_key)
+            df_state = st.data_editor(st.session_state[editor_key])
+            st.session_state[editor_key] = df_state
             csv_name = f"{Path(uploaded.name).stem}.csv"
             csv_data = df_state.drop(columns=["Selected"]).to_csv(index=False)
             st.download_button(
