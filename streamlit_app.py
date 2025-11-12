@@ -35,26 +35,22 @@ if uploads:
             df.insert(0, "Selected", False)
 
         with st.expander(uploaded.name):
-            state_key = f"df_{uploaded.name}"
-            if state_key not in st.session_state:
-                st.session_state[state_key] = df
-            df_state = st.session_state[state_key]
+            editor_key = f"editor_{uploaded.name}"
+            if editor_key not in st.session_state:
+                st.session_state[editor_key] = df
 
             col1, col2, col3 = st.columns(3)
             with col1:
                 if st.button("Select All", key=f"select_all_{uploaded.name}"):
-                    df_state["Selected"] = True
+                    st.session_state[editor_key]["Selected"] = True
             with col2:
                 if st.button("Unselect All", key=f"unselect_all_{uploaded.name}"):
-                    df_state["Selected"] = False
+                    st.session_state[editor_key]["Selected"] = False
             with col3:
                 if st.button("Flip Signs", key=f"flip_{uploaded.name}"):
-                    df_state.loc[df_state["Selected"], "Amount"] *= -1
+                    st.session_state[editor_key].loc[st.session_state[editor_key]["Selected"], "Amount"] *= -1
 
-            st.session_state[state_key] = df_state
-
-            df_state = st.data_editor(df_state, key=f"editor_{uploaded.name}")
-            st.session_state[state_key] = df_state
+            df_state = st.data_editor(st.session_state[editor_key], key=editor_key)
             csv_name = f"{Path(uploaded.name).stem}.csv"
             csv_data = df_state.drop(columns=["Selected"]).to_csv(index=False)
             st.download_button(
